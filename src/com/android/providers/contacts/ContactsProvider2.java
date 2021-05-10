@@ -20,6 +20,7 @@ import static android.Manifest.permission.INTERACT_ACROSS_USERS;
 import static android.Manifest.permission.INTERACT_ACROSS_USERS_FULL;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 
+import android.os.Looper;
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.accounts.OnAccountsUpdateListener;
@@ -60,8 +61,10 @@ import android.net.Uri;
 import android.net.Uri.Builder;
 import android.os.AsyncTask;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.CancellationSignal;
+import android.os.Handler;
 import android.os.ParcelFileDescriptor;
 import android.os.ParcelFileDescriptor.AutoCloseInputStream;
 import android.os.RemoteException;
@@ -257,6 +260,9 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
     /** Limit for the maximum number of social stream items to store under a raw contact. */
     private static final int MAX_STREAM_ITEMS_PER_RAW_CONTACT = 5;
+
+    /** Rate limit (in milliseconds) for notify change.  Do it as most once every 5 seconds. */
+    private static final int NOTIFY_CHANGE_RATE_LIMIT = 5 * 1000;
 
     /** Rate limit (in milliseconds) for photo cleanup.  Do it at most once per day. */
     private static final int PHOTO_CLEANUP_RATE_LIMIT = 24 * 60 * 60 * 1000;
@@ -1458,6 +1464,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
     private ContactsTaskScheduler mTaskScheduler;
 
+    private long mLastNotifyChange = 0;
+
     private long mLastPhotoCleanup = 0;
 
     private FastScrollingIndexCache mFastScrollingIndexCache;
@@ -1475,6 +1483,13 @@ public class ContactsProvider2 extends AbstractContactsProvider
         if (VERBOSE_LOGGING) {
             Log.v(TAG, "onCreate user="
                     + android.os.Process.myUserHandle().getIdentifier());
+        }
+        if (Build.IS_DEBUGGABLE) {
+            StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder()
+                    .detectLeakedSqlLiteObjects()  // for SqlLiteCursor
+                    .detectLeakedClosableObjects() // for any Cursor
+                    .penaltyLog()
+                    .build());
         }
 
         if (Log.isLoggable(Constants.PERFORMANCE_TAG, Log.DEBUG)) {
@@ -2575,9 +2590,40 @@ public class ContactsProvider2 extends AbstractContactsProvider
         mSyncToNetwork = false;
     }
 
-    protected void notifyChange(boolean syncToNetwork) {
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mChangeNotifier = () -> {
+        Log.v(TAG, "Scheduled notifyChange started.");
+        mLastNotifyChange = System.currentTimeMillis();
         getContext().getContentResolver().notifyChange(ContactsContract.AUTHORITY_URI, null,
+                false);
+    };
+
+    protected void notifyChange(boolean syncToNetwork) {
+        if (syncToNetwork) {
+            // Changes to sync to network won't be rate limited.
+            getContext().getContentResolver().notifyChange(ContactsContract.AUTHORITY_URI, null,
                 syncToNetwork);
+        } else {
+            // Rate limit the changes which are not to sync to network.
+            long currentTimeMillis = System.currentTimeMillis();
+
+            mHandler.removeCallbacks(mChangeNotifier);
+            if (currentTimeMillis > mLastNotifyChange + NOTIFY_CHANGE_RATE_LIMIT) {
+                // Notify change immediately, since it has been a while since last notify.
+                mLastNotifyChange = currentTimeMillis;
+                getContext().getContentResolver().notifyChange(ContactsContract.AUTHORITY_URI, null,
+                   false);
+            } else {
+                // Schedule a delayed notification, to ensure the very last notifyChange will be
+                // executed.
+                // Delay is set to two-fold of rate limit, and the subsequent notifyChange called
+                // (if ever) between the (NOTIFY_CHANGE_RATE_LIMIT, 2 * NOTIFY_CHANGE_RATE_LIMIT)
+                // time window, will cancel this delayed notification.
+                // The delayed notification is only expected to run if notifyChange is not invoked
+                // between the above time window.
+                mHandler.postDelayed(mChangeNotifier, NOTIFY_CHANGE_RATE_LIMIT * 2);
+            }
+         }
     }
 
     protected void setProviderStatus(int status) {
